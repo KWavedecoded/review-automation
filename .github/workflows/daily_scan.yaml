@@ -19,7 +19,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright httpx supabase
+          pip install playwright httpx supabase requests
           playwright install chromium
 
       - name: Run collector
