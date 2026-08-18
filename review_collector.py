@@ -1,36 +1,43 @@
 import os
 import requests
-from supabase import create_client
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
-# .env 파일 로드 시도
+# place_hunter.py에서 수집 기능을 정상적으로 가져옴
+from place_hunter import crawl_naver_reviews
+
 load_dotenv()
 
-# 환경변수 가져오기 (없을 경우 직접 입력한 기본값 fallback 적용)
-SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://vbyevgwsxykclgfmirsm.supabase.co"
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY") or "sb_publishable_-qIm2UGJ4wbf9sTTipnIcA_3JHiQKLH"
+# 환경변수 설정
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# 텔레그램 설정 정보
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or "8744300114:AAEv7F2S9zmPk5Xe9Ui5p5cZland3JzZcrw"
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or "8752082139"
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Supabase 클라이언트 초기화
-supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-
-def save_to_supabase(data):
-    """
-    Supabase의 store_reviews 테이블에 데이터를 삽입합니다.
-    """
+def is_already_processed(original_id):
+    """processed_reviews 테이블에서 이미 처리된 리뷰인지 원본 ID 기준으로 확인"""
     try:
-        response = supabase.table("store_reviews").insert(data).execute()
-        print("Supabase 저장 완료")
+        response = supabase.table("processed_reviews").select("id").eq("original_id", original_id).execute()
+        return len(response.data) > 0
     except Exception as e:
-        print(f"Supabase 저장 실패: {e}")
+        print(f"⚠️ 중복 조회 중 오류 발생: {e}")
+        return False
+
+def save_to_supabase(review_data):
+    """정제된 리뷰 데이터를 processed_reviews 테이블에 적재"""
+    try:
+        supabase.table("processed_reviews").insert(review_data).execute()
+        print(f"✅ processed_reviews 적재 완료 (Original ID: {review_data.get('original_id')})")
+    except Exception as e:
+        print(f"❌ Supabase 적재 실패: {e}")
 
 def send_to_telegram(message):
-    """
-    텔레그램 봇을 통해 실시간 알림 메시지를 직접 전송합니다.
-    """
+    """텔레그램 봇을 통해 실시간 알림 메시지 전송"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ 텔레그램 설정 누락")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -47,22 +54,32 @@ def send_to_telegram(message):
         print(f"텔레그램 전송 오류: {e}")
 
 if __name__ == "__main__":
-    dummy_review = {
-        "store_name": "테스트 매장",
-        "review_text": "Supabase 및 텔레그램 직결 연동 테스트 완료.",
-        "rating": 5
-    }
+    print("🚀 전체 파이프라인(수집 -> 검사 -> 저장 -> 알림) 실행 시작...")
     
-    print("데이터 처리 시작...")
-    
-    # 1. Supabase 적재
-    save_to_supabase(dummy_review)
-    
-    # 2. 텔레그램 직발송 메시지 구성 및 전송
-    notification_text = (
-        f"🚨 **새로운 리뷰가 등록되었습니다.**\n\n"
-        f"🏬 **매장명:** {dummy_review['store_name']}\n"
-        f"⭐ **평점:** {dummy_review['rating']}점\n"
-        f"📝 **내용:** {dummy_review['review_text']}"
-    )
-    send_to_telegram(notification_text)
+    # 1. place_hunter.py를 통해 리뷰 수집
+    raw_reviews = crawl_naver_reviews()
+
+    for rev in raw_reviews:
+        # 2. 중복 검사 (original_id 기준)
+        if not is_already_processed(rev["id"]):
+            payload = {
+                "original_id": rev["id"],
+                "sentiment": rev["sentiment"],
+                "keywords": rev["keywords"]
+            }
+            
+            # 3. processed_reviews 테이블에 적재
+            save_to_supabase(payload)
+            
+            # 4. 부정 리뷰일 경우 텔레그램 알림 전송
+            if rev["rating"] <= 2:
+                notification_text = (
+                    f"🚨 **부정 리뷰가 탐지되었습니다.**\n\n"
+                    f"🏬 **매장명:** {rev['store_name']}\n"
+                    f"⭐ **평점:** {rev['rating']}점\n"
+                    f"📝 **내용:** {rev['content']}\n"
+                    f"🏷️ **키워드:** {rev['keywords']}"
+                )
+                send_to_telegram(notification_text)
+        else:
+            print(f"⏩ 이미 처리된 리뷰입니다. (Original ID: {rev['id']})")
